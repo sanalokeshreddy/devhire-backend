@@ -1,6 +1,7 @@
 package com.devhire.service;
 
 import com.devhire.model.ResumeMatchResult;
+import com.devhire.model.TimelineEntry;
 import com.devhire.util.PdfExtractorUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,50 +20,106 @@ public class ResumeAnalysisService {
 
     public List<ResumeMatchResult> analyzeResumes(MultipartFile[] resumes, String jobRole, String jobDescription) {
         List<ResumeMatchResult> results = new ArrayList<>();
+        for (MultipartFile resume : resumes) {
+            ResumeMatchResult result = analyzeSingleResume(resume, jobDescription);
+            result.setFilename(resume.getOriginalFilename());
+            result.setTargetRole(jobRole); // Set target role
+            results.add(result);
+        }
+        return results;
+    }
+
+    public ResumeMatchResult analyzeSingleResume(MultipartFile resume, String jobDescription) {
         ObjectMapper mapper = new ObjectMapper();
 
-        for (MultipartFile file : resumes) {
-            try {
-                String extractedText = PdfExtractorUtil.extractText(file);
+        try {
+            String extractedText = PdfExtractorUtil.extractText(resume);
 
-                // 🔍 Analyze with Gemini
-                String cleanJson = aiService.analyzeWithAI(extractedText, jobRole, jobDescription);
-                JsonNode jsonResult = mapper.readTree(cleanJson);
+            // AI response
+            String cleanJson = aiService.analyzeWithAI(extractedText, "", jobDescription);
+            JsonNode jsonResult = mapper.readTree(cleanJson);
 
-                double match = jsonResult.get("matchPercentage").asDouble();
-                List<String> skills = new ArrayList<>();
-               for (JsonNode skillNode : jsonResult.get("missingSkills")) {
-    String cleanSkill = skillNode.asText().trim().toLowerCase();
-    skills.add(cleanSkill);
-}
+            // Skill-based strict scoring
+            List<String> requiredSkills = new ArrayList<>();
+            for (JsonNode skillNode : jsonResult.path("requiredSkills")) {
+                requiredSkills.add(skillNode.asText().toLowerCase());
+            }
 
+            List<String> resumeSkills = new ArrayList<>();
+            for (JsonNode skillNode : jsonResult.path("resumeSkills")) {
+                resumeSkills.add(skillNode.asText().toLowerCase());
+            }
 
-                String suggestions = jsonResult.get("suggestions").asText();
+            long matchedCount = requiredSkills.stream()
+                    .filter(resumeSkills::contains)
+                    .count();
 
-                // 🧠 AI-generated Summary
-                String summaryPrompt = "Summarize this resume with strengths, key technical skills, and potential gaps relevant to the role '" 
-                        + jobRole + "':\n" + extractedText;
-                String summary = aiService.getSummary(summaryPrompt);
+            double strictScore = (requiredSkills.isEmpty() ? 0 : (double) matchedCount / requiredSkills.size() * 100);
 
-                results.add(new ResumeMatchResult(
-                        file.getOriginalFilename(),
-                        match,
-                        skills,
-                        suggestions,
-                        summary
-                ));
-            } catch (Exception e) {
-                e.printStackTrace();
-                results.add(new ResumeMatchResult(
-                        file.getOriginalFilename(),
-                        0,
-                        List.of("AI Error"),
-                        "Failed to analyze resume: " + e.getMessage(),
-                        "No summary available due to an error."
+            // Optional penalties
+            List<String> missingSkills = new ArrayList<>();
+            for (JsonNode skillNode : jsonResult.path("missingSkills")) {
+                String skill = skillNode.asText().toLowerCase();
+                missingSkills.add(skill);
+                if ("java".equals(skill) || "spring boot".equals(skill)) {
+                    strictScore -= 10; // apply penalty
+                }
+            }
+            strictScore = Math.max(0, strictScore);
+
+            // Suggestions and other fields
+            String suggestions = jsonResult.path("suggestions").asText();
+            String summaryPrompt = "Summarize this resume:\n" + extractedText;
+            String summary = aiService.getSummary(summaryPrompt);
+            String targetRole = jsonResult.path("targetRole").asText();
+
+            List<String> courses = new ArrayList<>();
+            for (JsonNode course : jsonResult.path("courses")) {
+                courses.add(course.asText());
+            }
+
+            String miniProject = jsonResult.path("miniProject").asText();
+
+            List<TimelineEntry> timeline = new ArrayList<>();
+            for (JsonNode item : jsonResult.path("timeline")) {
+                timeline.add(new TimelineEntry(
+                        item.get("week").asText(),
+                        item.get("focus").asText()
                 ));
             }
-        }
 
-        return results;
+            List<String> githubLinks = new ArrayList<>();
+            for (JsonNode link : jsonResult.path("githubLinks")) {
+                githubLinks.add(link.asText());
+            }
+
+            return new ResumeMatchResult(
+                    resume.getOriginalFilename(),
+                    strictScore,
+                    missingSkills,
+                    suggestions,
+                    summary,
+                    targetRole,
+                    courses,
+                    miniProject,
+                    timeline,
+                    githubLinks
+            );
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return new ResumeMatchResult(
+                    resume.getOriginalFilename(),
+                    0,
+                    List.of("AI Error"),
+                    "Failed to analyze resume: " + e.getMessage(),
+                    "No summary available due to error.",
+                    "",
+                    new ArrayList<>(),
+                    "",
+                    new ArrayList<>(),
+                    new ArrayList<>()
+            );
+        }
     }
 }
